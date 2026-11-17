@@ -132,6 +132,8 @@ notifications instead of implementing a progress UI in the application:
 wasdk-downloader = { path = "../wasdk-downloader", features = ["toast"] }
 ```
 
+https://github.com/user-attachments/assets/1c3f6a7f-3d64-4307-80cc-27c47ae28bba
+
 ```rust,no_run
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     wasdk_downloader::ensure_runtime_with_toast(
