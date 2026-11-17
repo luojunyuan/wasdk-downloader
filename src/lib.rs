@@ -124,6 +124,15 @@ impl Architecture {
     }
 }
 
+/// Byte-level progress for an installer download.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DownloadProgress {
+    /// Number of response-body bytes received so far.
+    pub received_bytes: u64,
+    /// Total response-body size when the server provides it.
+    pub total_bytes: Option<u64>,
+}
+
 /// Errors that can occur while checking, downloading, or verifying the runtime.
 #[derive(Debug)]
 pub enum Error {
@@ -244,6 +253,25 @@ pub fn download() -> Result<PathBuf, Error> {
     download_version(DEFAULT_RUNTIME_VERSION)
 }
 
+/// Downloads the default installer and reports byte-level progress.
+///
+/// The callback is first called with zero bytes after the response headers are
+/// received, then after each response chunk is written. `total_bytes` is
+/// `None` when the response does not provide a usable content length. A valid
+/// cached installer is reused without calling the callback.
+pub fn download_with_progress<F>(on_progress: F) -> Result<PathBuf, Error>
+where
+    F: FnMut(DownloadProgress),
+{
+    let architecture = Architecture::current()?;
+    download_version_for_to_with_progress(
+        DEFAULT_RUNTIME_VERSION,
+        architecture,
+        default_path_for_version(DEFAULT_RUNTIME_VERSION, architecture),
+        on_progress,
+    )
+}
+
 /// Downloads the requested architecture's installer to the default cache path.
 pub fn download_for(architecture: Architecture) -> Result<PathBuf, Error> {
     download_version_for(DEFAULT_RUNTIME_VERSION, architecture)
@@ -297,17 +325,56 @@ pub fn download_version_for_to(
     architecture: Architecture,
     destination: impl AsRef<Path>,
 ) -> Result<PathBuf, Error> {
+    download_version_for_to_with_progress(version, architecture, destination, |_| {})
+}
+
+/// Downloads an installer to `destination` and reports byte-level progress.
+///
+/// The callback is first called with zero bytes after the response headers are
+/// received, then after each response chunk is written. `total_bytes` is
+/// `None` when the response does not provide a usable content length. A valid
+/// installer already at the destination is reused without calling the callback.
+pub fn download_version_for_to_with_progress<F>(
+    version: RuntimeVersion,
+    architecture: Architecture,
+    destination: impl AsRef<Path>,
+    on_progress: F,
+) -> Result<PathBuf, Error>
+where
+    F: FnMut(DownloadProgress),
+{
     let destination = destination.as_ref().to_path_buf();
-    run_blocking(download_version_for_to_async(
+    run_blocking(download_version_for_to_async_with_progress(
         version,
         architecture,
         destination,
+        on_progress,
     ))
 }
 
 /// Asynchronously downloads the installer for the current architecture to the default cache path.
 pub async fn download_async() -> Result<PathBuf, Error> {
     download_version_async(DEFAULT_RUNTIME_VERSION).await
+}
+
+/// Asynchronously downloads the default installer and reports byte-level progress.
+///
+/// The callback is first called with zero bytes after the response headers are
+/// received, then after each response chunk is written. `total_bytes` is
+/// `None` when the response does not provide a usable content length. A valid
+/// cached installer is reused without calling the callback.
+pub async fn download_async_with_progress<F>(on_progress: F) -> Result<PathBuf, Error>
+where
+    F: FnMut(DownloadProgress),
+{
+    let architecture = Architecture::current()?;
+    download_version_for_to_async_with_progress(
+        DEFAULT_RUNTIME_VERSION,
+        architecture,
+        default_path_for_version(DEFAULT_RUNTIME_VERSION, architecture),
+        on_progress,
+    )
+    .await
 }
 
 /// Asynchronously downloads the requested architecture's installer to the default cache path.
@@ -360,6 +427,24 @@ pub async fn download_version_for_to_async(
     architecture: Architecture,
     destination: impl AsRef<Path>,
 ) -> Result<PathBuf, Error> {
+    download_version_for_to_async_with_progress(version, architecture, destination, |_| {}).await
+}
+
+/// Asynchronously downloads an installer and reports byte-level progress.
+///
+/// The callback is first called with zero bytes after the response headers are
+/// received, then after each response chunk is written. `total_bytes` is
+/// `None` when the response does not provide a usable content length. A valid
+/// installer already at the destination is reused without calling the callback.
+pub async fn download_version_for_to_async_with_progress<F>(
+    version: RuntimeVersion,
+    architecture: Architecture,
+    destination: impl AsRef<Path>,
+    mut on_progress: F,
+) -> Result<PathBuf, Error>
+where
+    F: FnMut(DownloadProgress),
+{
     let destination = destination.as_ref().to_path_buf();
     let (url, expected_hash) = version.installer(architecture);
     let expected_hash = decode_sha256(expected_hash)?;
@@ -397,12 +482,20 @@ pub async fn download_version_for_to_async(
     let (mut output, partial_path) = create_partial_file(&destination)?;
     let mut partial = PartialFile::new(partial_path);
     let mut received = 0_u64;
+    on_progress(DownloadProgress {
+        received_bytes: received,
+        total_bytes: expected_size,
+    });
 
     while let Some(chunk) = response.chunk().await.map_err(Error::Http)? {
         output.write_all(&chunk)?;
         received = received
             .checked_add(chunk.len() as u64)
             .ok_or(Error::InvalidInstaller)?;
+        on_progress(DownloadProgress {
+            received_bytes: received,
+            total_bytes: expected_size,
+        });
     }
     output.flush()?;
     drop(output);

@@ -85,6 +85,32 @@ Async applications can use `download_async`, `download_to_async`, or
 All download functions return the verified installer path; they do not run the
 installer.
 
+## Progress reporting
+
+Use `download_with_progress` (or `download_async_with_progress`) to receive
+byte-level updates for the default installer:
+
+```rust,no_run
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let installer = wasdk_downloader::download_with_progress(|progress| {
+        if let Some(total) = progress.total_bytes {
+            println!("{} / {} bytes", progress.received_bytes, total);
+        } else {
+            println!("{} bytes", progress.received_bytes);
+        }
+    })?;
+    println!("{}", installer.display());
+    Ok(())
+}
+```
+
+For a specific version, architecture, or destination, use
+`download_version_for_to_with_progress`; the async equivalent is
+`download_version_for_to_async_with_progress`. The callback receives an initial
+zero-byte update and then one update after each response chunk is written.
+`total_bytes` is `None` if the response has no usable content length. A valid
+cached installer is returned without invoking the callback.
+
 The default cache is `%LOCALAPPDATA%\\WindowsAppSDK\\<version>\\<arch>`, with
 the system temporary directory used when `LOCALAPPDATA` is unavailable.
 Existing files are reused only after their size, PE header, and
