@@ -12,11 +12,15 @@ use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use wrest::Client;
+
+#[cfg(feature = "toast")]
+mod toast;
 
 /// The latest supported Windows App SDK release.
 pub const RUNTIME_VERSION: &str = "2.6.5";
@@ -45,6 +49,7 @@ const V2_6_5_ARM64_SHA256: &str =
 const V2_6_5_X64_SHA256: &str = "908e9a8ed8ad2ac765d6679543b0758812437e3ad6e3223f08d1730635cec8ec";
 const V2_6_5_X86_SHA256: &str = "cb4fbfd1f4ebc29fa2003bab5eb32b52ef7fb20424faebc62fa53ba3e20eca31";
 
+const DOWNLOAD_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0";
 const MIN_INSTALLER_SIZE: u64 = 1_048_576;
 const DOWNLOAD_BUFFER_SIZE: usize = 128 * 1024;
 const FRAMEWORK_PACKAGE_NAME: &str = "Microsoft.WindowsAppRuntime.2";
@@ -133,7 +138,31 @@ pub struct DownloadProgress {
     pub total_bytes: Option<u64>,
 }
 
-/// Errors that can occur while checking, downloading, or verifying the runtime.
+/// A phase reported while ensuring the default runtime is installed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeSetupProgress {
+    /// A compatible runtime was already installed.
+    AlreadyInstalled,
+    /// No compatible runtime was found; setup is about to download or install it.
+    RuntimeMissing,
+    /// The verified installer is being downloaded.
+    Downloading(DownloadProgress),
+    /// The installer is running. It does not expose a reliable install percentage.
+    Installing,
+    /// Installation completed and the runtime package was verified.
+    Installed,
+}
+
+/// The result of ensuring the default runtime is installed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeSetupOutcome {
+    /// A compatible runtime was already installed.
+    AlreadyInstalled,
+    /// The runtime was downloaded and installed by this call.
+    Installed,
+}
+
+/// Errors that can occur while checking, downloading, verifying, or installing the runtime.
 #[derive(Debug)]
 pub enum Error {
     /// The current process architecture is not supported by the runtime.
@@ -150,6 +179,12 @@ pub enum Error {
     InvalidInstaller,
     /// Windows could not query the installed Windows App SDK packages.
     RuntimeQuery(i32),
+    /// The runtime installer process could not be started.
+    Install(io::Error),
+    /// The runtime installer returned an unsuccessful exit code.
+    InstallerExit(Option<i32>),
+    /// The installer exited successfully, but the runtime is still unavailable.
+    RuntimeNotInstalledAfterInstall,
     /// Windows returned an invalid package identity while querying the runtime.
     InvalidRuntimePackageIdentity,
     /// Windows could not create the executor used by a blocking call.
@@ -182,6 +217,16 @@ impl std::fmt::Display for Error {
                 formatter,
                 "could not query Windows App SDK packages (Win32 error {status})"
             ),
+            Self::Install(error) => write!(formatter, "could not start runtime installer: {error}"),
+            Self::InstallerExit(Some(status)) => {
+                write!(formatter, "runtime installer returned exit code {status}")
+            }
+            Self::InstallerExit(None) => {
+                formatter.write_str("runtime installer terminated without an exit code")
+            }
+            Self::RuntimeNotInstalledAfterInstall => formatter.write_str(
+                "runtime installer completed, but the Windows App SDK runtime is still unavailable",
+            ),
             Self::InvalidRuntimePackageIdentity => {
                 write!(
                     formatter,
@@ -202,7 +247,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Http(error) => Some(error),
-            Self::Io(error) | Self::Runtime(error) => Some(error),
+            Self::Io(error) | Self::Install(error) | Self::Runtime(error) => Some(error),
             _ => None,
         }
     }
@@ -218,6 +263,77 @@ impl From<io::Error> for Error {
 /// process architecture and current Windows user.
 pub fn runtime_is_installed() -> Result<bool, Error> {
     runtime_version_is_installed(DEFAULT_RUNTIME_VERSION)
+}
+
+/// Checks, downloads, and installs the default Windows App SDK runtime when needed.
+///
+/// Download callbacks report byte-level progress. Installation only reports its
+/// phase because the Microsoft installer does not provide a reliable progress
+/// percentage. Successful installer exit codes `3010` and `1641` are accepted,
+/// package registration is checked again before returning success, and the
+/// installer is removed from the temporary directory after verified success.
+pub fn ensure_runtime_with_progress<F>(mut on_progress: F) -> Result<RuntimeSetupOutcome, Error>
+where
+    F: FnMut(RuntimeSetupProgress),
+{
+    if runtime_is_installed()? {
+        on_progress(RuntimeSetupProgress::AlreadyInstalled);
+        return Ok(RuntimeSetupOutcome::AlreadyInstalled);
+    }
+
+    on_progress(RuntimeSetupProgress::RuntimeMissing);
+    let installer = download_with_progress(|progress| {
+        on_progress(RuntimeSetupProgress::Downloading(progress));
+    })?;
+
+    on_progress(RuntimeSetupProgress::Installing);
+    let status = Command::new(&installer)
+        .arg("--quiet")
+        .status()
+        .map_err(Error::Install)?;
+    if !status.success() && !matches!(status.code(), Some(3010) | Some(1641)) {
+        return Err(Error::InstallerExit(status.code()));
+    }
+
+    if !runtime_is_installed()? {
+        return Err(Error::RuntimeNotInstalledAfterInstall);
+    }
+
+    remove_installer(&installer);
+    on_progress(RuntimeSetupProgress::Installed);
+    Ok(RuntimeSetupOutcome::Installed)
+}
+
+/// Checks, downloads, and installs the default runtime while reporting progress
+/// through Windows toast notifications.
+///
+/// Enable the `toast` feature to use this function. `app_user_model_id` is
+/// registered for the current user so unpackaged desktop applications can show
+/// toasts. Notification setup is best-effort; this function returns the same
+/// runtime setup result as [`ensure_runtime_with_progress`]. The temporary
+/// registration is restored or removed when the notification worker exits.
+#[cfg(feature = "toast")]
+pub fn ensure_runtime_with_toast(
+    app_user_model_id: &str,
+    app_display_name: &str,
+) -> Result<RuntimeSetupOutcome, Error> {
+    let mut notifier = None;
+    let result = ensure_runtime_with_progress(|progress| {
+        if matches!(progress, RuntimeSetupProgress::RuntimeMissing) {
+            notifier = Some(toast::RuntimeNotifier::new(
+                app_user_model_id.to_string(),
+                app_display_name.to_string(),
+            ));
+        }
+        if let Some(notifier) = &notifier {
+            notifier.update(progress);
+        }
+    });
+
+    if let (Some(notifier), Err(error)) = (&notifier, &result) {
+        notifier.failed(&error.to_string());
+    }
+    result
 }
 
 /// Checks whether the default runtime version is registered for `architecture`
@@ -245,10 +361,10 @@ pub fn runtime_version_is_installed_for(
         .any(|full_name| runtime_package_matches(full_name, architecture, minimum_version)))
 }
 
-/// Downloads the installer for the current architecture to the default cache path.
+/// Downloads the installer for the current architecture to the default temporary path.
 ///
-/// The cache is `%LOCALAPPDATA%\\WindowsAppSDK\\<version>\\<arch>`. A valid
-/// installer already at that path is reused.
+/// The path is under the system temporary directory. A valid installer already
+/// at that path is reused.
 pub fn download() -> Result<PathBuf, Error> {
     download_version(DEFAULT_RUNTIME_VERSION)
 }
@@ -272,7 +388,7 @@ where
     )
 }
 
-/// Downloads the requested architecture's installer to the default cache path.
+/// Downloads the requested architecture's installer to the default temporary path.
 pub fn download_for(architecture: Architecture) -> Result<PathBuf, Error> {
     download_version_for(DEFAULT_RUNTIME_VERSION, architecture)
 }
@@ -294,12 +410,12 @@ pub fn download_for_to(
     download_version_for_to(DEFAULT_RUNTIME_VERSION, architecture, destination)
 }
 
-/// Downloads the current architecture's installer for `version` to the default cache path.
+/// Downloads the current architecture's installer for `version` to the default temporary path.
 pub fn download_version(version: RuntimeVersion) -> Result<PathBuf, Error> {
     download_version_for(version, Architecture::current()?)
 }
 
-/// Downloads the requested version and architecture to the default cache path.
+/// Downloads the requested version and architecture to the default temporary path.
 pub fn download_version_for(
     version: RuntimeVersion,
     architecture: Architecture,
@@ -352,7 +468,7 @@ where
     ))
 }
 
-/// Asynchronously downloads the installer for the current architecture to the default cache path.
+/// Asynchronously downloads the installer for the current architecture to the default temporary path.
 pub async fn download_async() -> Result<PathBuf, Error> {
     download_version_async(DEFAULT_RUNTIME_VERSION).await
 }
@@ -377,7 +493,7 @@ where
     .await
 }
 
-/// Asynchronously downloads the requested architecture's installer to the default cache path.
+/// Asynchronously downloads the requested architecture's installer to the default temporary path.
 pub async fn download_for_async(architecture: Architecture) -> Result<PathBuf, Error> {
     download_version_for_async(DEFAULT_RUNTIME_VERSION, architecture).await
 }
@@ -395,12 +511,12 @@ pub async fn download_for_to_async(
     download_version_for_to_async(DEFAULT_RUNTIME_VERSION, architecture, destination).await
 }
 
-/// Asynchronously downloads the current architecture's installer for `version` to the default cache path.
+/// Asynchronously downloads the current architecture's installer for `version` to the default temporary path.
 pub async fn download_version_async(version: RuntimeVersion) -> Result<PathBuf, Error> {
     download_version_for_async(version, Architecture::current()?).await
 }
 
-/// Asynchronously downloads the requested version and architecture to the default cache path.
+/// Asynchronously downloads the requested version and architecture to the default temporary path.
 pub async fn download_version_for_async(
     version: RuntimeVersion,
     architecture: Architecture,
@@ -461,7 +577,7 @@ where
     }
 
     let client = Client::builder()
-        .user_agent(concat!("wasdk-downloader/", env!("CARGO_PKG_VERSION")))
+        .user_agent(DOWNLOAD_USER_AGENT)
         .connect_timeout(Duration::from_secs(20))
         .build()
         .map_err(Error::Http)?;
@@ -517,17 +633,15 @@ where
     Ok(destination)
 }
 
-/// Returns the default cache location for the latest supported version.
+/// Returns the default temporary location for the latest supported version.
 pub fn default_path_for(architecture: Architecture) -> PathBuf {
     default_path_for_version(DEFAULT_RUNTIME_VERSION, architecture)
 }
 
-/// Returns the default cache location for a specific version and architecture.
+/// Returns the default temporary location for a specific version and architecture.
 pub fn default_path_for_version(version: RuntimeVersion, architecture: Architecture) -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("WindowsAppSDK")
+    std::env::temp_dir()
+        .join("WindowsAppSDK")
         .join(version.as_str())
         .join(architecture.as_str())
         .join(format!(
@@ -535,6 +649,14 @@ pub fn default_path_for_version(version: RuntimeVersion, architecture: Architect
             version.as_str(),
             architecture.as_str(),
         ))
+}
+
+fn remove_installer(installer: &Path) {
+    if let Err(error) = fs::remove_file(installer)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        eprintln!("Could not remove Windows App SDK installer: {error}");
+    }
 }
 
 fn package_family_full_names(family_name: &[u16]) -> Result<Vec<String>, Error> {

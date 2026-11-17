@@ -20,7 +20,8 @@ Add the library to the consuming project's `Cargo.toml`:
 wasdk-downloader = { path = "../wasdk-downloader" }
 ```
 
-Download the current process architecture's installer into the standard cache:
+Download the current process architecture's installer into the system
+temporary directory:
 
 ```rust,no_run
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -82,8 +83,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Async applications can use `download_async`, `download_to_async`, or
 `download_for_to_async`. The blocking functions use `wrest`'s bundled executor.
-All download functions return the verified installer path; they do not run the
-installer.
+Download functions return the verified installer path without running it.
+
+## Runtime setup
+
+Use `ensure_runtime_with_progress` when the application should install the
+default runtime automatically. It checks for an existing compatible runtime,
+downloads and verifies the installer if needed, runs it quietly, then verifies
+that the runtime package is registered:
+
+```rust,no_run
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use wasdk_downloader::{RuntimeSetupOutcome, RuntimeSetupProgress};
+
+    let outcome = wasdk_downloader::ensure_runtime_with_progress(|progress| match progress {
+        RuntimeSetupProgress::AlreadyInstalled => {}
+        RuntimeSetupProgress::RuntimeMissing => println!("Runtime is missing"),
+        RuntimeSetupProgress::Downloading(progress) => {
+            if let Some(total) = progress.total_bytes {
+                println!("Downloading: {} / {} bytes", progress.received_bytes, total);
+            } else {
+                println!("Downloading: {} bytes", progress.received_bytes);
+            }
+        }
+        RuntimeSetupProgress::Installing => println!("Installing runtime"),
+        RuntimeSetupProgress::Installed => println!("Runtime installed"),
+    })?;
+
+    if outcome == RuntimeSetupOutcome::AlreadyInstalled {
+        println!("Runtime was already installed");
+    }
+    Ok(())
+}
+```
+
+Installer progress is reported as a phase only; the Microsoft installer does
+not expose a reliable percentage. Installer exit codes `3010` and `1641` are
+accepted, followed by a package-registration check. Once installation is
+verified, the library attempts to remove the installer executable from the
+temporary directory. A cleanup failure is logged without treating the
+successful installation as a failure. Install failures leave the installer in
+place for diagnosis or retry.
+
+Enable the optional `toast` feature to report setup through Windows toast
+notifications instead of implementing a progress UI in the application:
+
+```toml
+wasdk-downloader = { path = "../wasdk-downloader", features = ["toast"] }
+```
+
+```rust,no_run
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    wasdk_downloader::ensure_runtime_with_toast(
+        "Example.WindowsAppRuntime",
+        "Example App",
+    )?;
+    Ok(())
+}
+```
+
+The feature uses the `windows` crate from the Windows-rs revision pinned by
+this project. Toast notifications are best-effort; runtime setup errors are
+still returned to the caller. The feature temporarily registers the requested
+AppUserModelId and restores its previous `DisplayName`, or removes the value it
+added. It removes the AUMID key only when this call created it and it remains
+empty after cleanup.
 
 ## Progress reporting
 
@@ -111,8 +175,7 @@ zero-byte update and then one update after each response chunk is written.
 `total_bytes` is `None` if the response has no usable content length. A valid
 cached installer is returned without invoking the callback.
 
-The default cache is `%LOCALAPPDATA%\\WindowsAppSDK\\<version>\\<arch>`, with
-the system temporary directory used when `LOCALAPPDATA` is unavailable.
-Existing files are reused only after their size, PE header, and
-version-and-architecture-specific SHA-256 have been verified. Failed downloads
-leave the destination untouched.
+The default download path is `%TEMP%\\WindowsAppSDK\\<version>\\<arch>`. A
+verified existing installer at that path is reused. Existing files are reused
+only after their size, PE header, and version-and-architecture-specific SHA-256
+have been verified. Failed downloads leave the destination untouched.

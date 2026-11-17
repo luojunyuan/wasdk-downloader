@@ -2,13 +2,25 @@
 name = "wasdk-downloader"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.100"
 description = "Download and verify the Windows App SDK runtime installer"
 keywords = ["windows", "windows-app-sdk", "download"]
 categories = ["os::windows-apis"]
 
 [dependencies]
 wrest = { version = "0.5.7", default-features = false, features = ["http2", "system-proxy"] }
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "d9b5a0692301c66509eb830e41cf38c997373f8d", optional = true, features = [
+    "Foundation",
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "combaseapi",
+    "objbase",
+    "winnt",
+    "winreg",
+] }
+
+[features]
+toast = ["dep:windows"]
 
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
